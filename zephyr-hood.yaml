@@ -1,0 +1,279 @@
+# Zephyr DLG-E36AWX range hood: local RF bridge for Home Assistant
+# Hardware: ESP32 DevKit V1 (WROOM-32) + Ebyte E07-M1101D CC1101 module
+#
+# Wiring (single-pin, open-drain, per ESPHome CC1101 docs for ESP32):
+#   CC1101 pin 1 GND   -> GND (next to 3V3)
+#   CC1101 pin 2 VCC   -> 3V3   (never VIN)
+#   CC1101 pin 3 GDO0  -> D4    (shared TX/RX data)
+#   CC1101 pin 4 CSN   -> D5
+#   CC1101 pin 5 SCK   -> D18
+#   CC1101 pin 6 MOSI  -> D23
+#   CC1101 pin 7 MISO  -> D19
+#   CC1101 pin 8 GDO2  -> not used
+#
+# Remote protocol (captured 2026-10-27):
+#   315 MHz OOK, PT2262/EV1527-style 24-bit fixed code, ~270 us unit
+#   0 = 1 unit on + 3 off, 1 = 3 on + 1 off, sync = 1 on + 31 off
+#   Address 0x0514 + 1 command byte; the remote repeats each code 7-8 times.
+
+substitutions:
+  name: zephyr-hood
+  friendly_name: Zephyr Hood
+  code_light: "0x051430"
+  code_power: "0x05140C"
+  code_fan: "0x051403"
+  code_delay: "0x0514C0"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32doit-devkit-v1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret zephyr_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+globals:
+  - id: last_code
+    type: uint32_t
+    initial_value: "0"
+
+# ---- Radio -----------------------------------------------------------------
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+cc1101:
+  id: rf
+  cs_pin:
+    number: GPIO5
+    ignore_strapping_warning: true   # idles high, which is what GPIO5 needs at boot
+  frequency: 315MHz
+  filter_bandwidth: 812kHz           # proven setting; can be narrowed later
+  modulation_type: ASK/OOK
+  output_power: 10
+
+remote_transmitter:
+  id: rf_tx
+  pin:
+    number: GPIO4
+    mode:
+      input: true
+      output: true
+      pullup: true
+      open_drain: true
+    allow_other_uses: true
+  eot_level: false
+  carrier_duty_percent: 100%
+  non_blocking: true
+  on_transmit:
+    then:
+      - cc1101.set_idle
+      - remote_transmitter.digital_write: false
+      - cc1101.begin_tx
+  on_complete:
+    then:
+      - cc1101.set_idle
+      - remote_transmitter.digital_write: true
+      - cc1101.begin_rx
+
+remote_receiver:
+  id: rf_rx
+  pin:
+    number: GPIO4
+    mode:
+      input: true
+      output: true
+      pullup: true
+      open_drain: true
+    allow_other_uses: true
+  filter: 150us
+  idle: 25ms
+  rmt_symbols: 384
+  receive_symbols: 384
+  on_raw:
+    then:
+      - lambda: |-
+          // Decode 24-bit words: data bits, then a sync pulse (~8.4 ms low).
+          auto is_short = [](int32_t v) { return v >= 120 && v <= 480; };
+          auto is_long  = [](int32_t v) { return v >= 560 && v <= 1100; };
+          static uint32_t prev_code = 0;
+          static uint32_t prev_ms = 0;
+          uint32_t bits = 0;
+          int nbits = 0;
+          const size_t n = x.size();
+          for (size_t i = 0; i < n; i++) {
+            int32_t mark = x[i];
+            if (mark <= 0) { bits = 0; nbits = 0; continue; }
+            int32_t space = (i + 1 < n && x[i + 1] < 0) ? -x[i + 1] : 25000;
+            if (space >= 5000) {
+              if (nbits == 24 && is_short(mark)) {
+                uint32_t code = bits & 0xFFFFFF;
+                uint32_t now = millis();
+                // one event per button press, not per repeat
+                if (!(code == prev_code && now - prev_ms < 600)) {
+                  id(last_code) = code;
+                  char buf[12];
+                  snprintf(buf, sizeof(buf), "0x%06X", (unsigned) code);
+                  ESP_LOGI("zephyr", "Remote pressed: %s", buf);
+                  id(last_rx_code).publish_state(buf);
+                  if (code == ${code_light}) id(remote_press).trigger("light");
+                  else if (code == ${code_power}) id(remote_press).trigger("power");
+                  else if (code == ${code_fan}) id(remote_press).trigger("fan");
+                  else if (code == ${code_delay}) id(remote_press).trigger("delay_off");
+                }
+                prev_code = code;
+                prev_ms = now;
+              }
+              bits = 0; nbits = 0;
+            } else if (is_long(mark) && is_short(space)) {
+              bits = (bits << 1) | 1u; nbits++;
+            } else if (is_short(mark) && is_long(space)) {
+              bits = (bits << 1); nbits++;
+            } else {
+              bits = 0; nbits = 0;
+            }
+            if (i + 1 < n && x[i + 1] < 0) i++;
+            if (nbits > 24) { bits = 0; nbits = 0; }
+          }
+
+# ---- Sending ---------------------------------------------------------------
+script:
+  - id: send_zephyr
+    mode: queued
+    parameters:
+      code: int
+    then:
+      - lambda: |-
+          uint32_t c = (uint32_t) code & 0xFFFFFF;
+          const uint32_t T = 270;  // protocol unit, us
+          auto call = id(rf_tx).transmit();
+          auto *data = call.get_data();
+          data->set_carrier_frequency(0);
+          for (int b = 23; b >= 0; b--) {
+            if ((c >> b) & 1u) { data->mark(3 * T); data->space(T); }
+            else               { data->mark(T); data->space(3 * T); }
+          }
+          data->mark(T);            // sync
+          data->space(31 * T);
+          call.set_send_times(10);
+          call.set_send_wait(0);
+          call.perform();
+          ESP_LOGI("zephyr", "Sent 0x%06X", (unsigned) c);
+      - delay: 400ms            # 10 words take ~285 ms; space out queued presses
+
+button:
+  - platform: template
+    name: "Light"
+    icon: mdi:lightbulb
+    on_press:
+      - script.execute:
+          id: send_zephyr
+          code: !lambda "return ${code_light};"
+  - platform: template
+    name: "Fan"
+    icon: mdi:fan
+    on_press:
+      - script.execute:
+          id: send_zephyr
+          code: !lambda "return ${code_fan};"
+  - platform: template
+    name: "Power off"
+    icon: mdi:power
+    on_press:
+      - script.execute:
+          id: send_zephyr
+          code: !lambda "return ${code_power};"
+  - platform: template
+    name: "Delay off"
+    icon: mdi:timer-outline
+    on_press:
+      - script.execute:
+          id: send_zephyr
+          code: !lambda "return ${code_delay};"
+
+# Momentary switches for HomeKit. HomeKit has no "button" tile, and HA's
+# HomeKit Bridge shows HA buttons as switches that stay on for 10 s. These
+# switches send ONE press when turned on, then flip back to off by themselves
+# after 1 s without sending anything. Turning one off does nothing.
+switch:
+  - platform: template
+    id: light_tap
+    name: "Light tap"
+    icon: mdi:lightbulb
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - script.execute: { id: send_zephyr, code: !lambda "return ${code_light};" }
+      - delay: 1s
+      - lambda: id(light_tap).publish_state(false);   # spring back, no second press
+  - platform: template
+    id: fan_tap
+    name: "Fan tap"
+    icon: mdi:fan
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - script.execute: { id: send_zephyr, code: !lambda "return ${code_fan};" }
+      - delay: 1s
+      - lambda: id(fan_tap).publish_state(false);   # spring back, no second press
+  - platform: template
+    id: power_tap
+    name: "Power off tap"
+    icon: mdi:power
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - script.execute: { id: send_zephyr, code: !lambda "return ${code_power};" }
+      - delay: 1s
+      - lambda: id(power_tap).publish_state(false);   # spring back, no second press
+  - platform: template
+    id: delay_tap
+    name: "Delay off tap"
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - script.execute: { id: send_zephyr, code: !lambda "return ${code_delay};" }
+      - delay: 1s
+      - lambda: id(delay_tap).publish_state(false);   # spring back, no second press
+
+# Fires when the physical remote is used, for automations
+event:
+  - platform: template
+    id: remote_press
+    name: "Remote button"
+    icon: mdi:remote
+    event_types:
+      - light
+      - power
+      - fan
+      - delay_off
+
+text_sensor:
+  - platform: template
+    id: last_rx_code
+    name: "Last remote code"
+    icon: mdi:remote
+    entity_category: diagnostic
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+    entity_category: diagnostic
